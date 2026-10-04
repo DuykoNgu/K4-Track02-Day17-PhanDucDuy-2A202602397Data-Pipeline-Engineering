@@ -23,6 +23,8 @@ import re
 
 import duckdb
 
+from .embed import text_hash
+
 MODEL = "fake-llm-2026-09"
 PROMPT_VERSION = "triage-v1"
 ALLOWED_LABELS = ("bug", "billing", "other")
@@ -81,13 +83,60 @@ def live_tickets(con: duckdb.DuckDBPyConnection) -> list[tuple[str, str]]:
 
 
 def label_tickets(con: duckdb.DuckDBPyConnection, llm: FakeLLM) -> dict:
-    """NAIVE version (shipped): one LLM call per ticket per run, no validation."""
-    rows = []
+    """Production version: cache by hash(input)+model+prompt, validate, quarantine bad labels."""
+    con.execute("""CREATE TABLE IF NOT EXISTS llm_label_cache (
+        cache_key VARCHAR PRIMARY KEY,
+        raw_response VARCHAR,
+        label VARCHAR,
+        model VARCHAR,
+        prompt_version VARCHAR
+    )""")
+    con.execute("""CREATE TABLE IF NOT EXISTS llm_label_quarantine (
+        ticket_id VARCHAR,
+        raw VARCHAR,
+        model VARCHAR,
+        prompt_version VARCHAR
+    )""")
+
+    cached_rows = con.execute(
+        "SELECT cache_key, raw_response, label FROM llm_label_cache WHERE model = ? AND prompt_version = ?",
+        [llm.model, PROMPT_VERSION]
+    ).fetchall()
+    cache = {r[0]: (r[1], r[2]) for r in cached_rows}
+
+    gold_rows = []
+    quarantine_rows = []
+    new_cache_entries = []
+
     for ticket_id, text in live_tickets(con):
-        raw = llm.complete(PROMPT_TEMPLATE.format(text=text))
-        rows.append((ticket_id, raw, MODEL, PROMPT_VERSION))
+        key = f"{text_hash(text)}:{llm.model}:{PROMPT_VERSION}"
+        if key in cache:
+            raw, label = cache[key]
+        else:
+            prompt = PROMPT_TEMPLATE.format(text=text)
+            raw = llm.complete(prompt)
+            label = parse_label(raw)
+            new_cache_entries.append((key, raw, label, llm.model, PROMPT_VERSION))
+            cache[key] = (raw, label)
+
+        if label in ALLOWED_LABELS:
+            gold_rows.append((ticket_id, label, llm.model, PROMPT_VERSION))
+        else:
+            quarantine_rows.append((ticket_id, raw, llm.model, PROMPT_VERSION))
+
+    if new_cache_entries:
+        con.executemany("INSERT INTO llm_label_cache VALUES (?, ?, ?, ?, ?)", new_cache_entries)
+
     con.execute("""CREATE OR REPLACE TABLE gold_ticket_labels (
         ticket_id VARCHAR, label VARCHAR, model VARCHAR, prompt_version VARCHAR)""")
-    if rows:
-        con.executemany("INSERT INTO gold_ticket_labels VALUES (?, ?, ?, ?)", rows)
-    return {"labeled": len(rows), "calls": llm.calls}
+    if gold_rows:
+        con.executemany("INSERT INTO gold_ticket_labels VALUES (?, ?, ?, ?)", gold_rows)
+
+    if quarantine_rows:
+        con.execute(
+            "DELETE FROM llm_label_quarantine WHERE model = ? AND prompt_version = ?",
+            [llm.model, PROMPT_VERSION]
+        )
+        con.executemany("INSERT INTO llm_label_quarantine VALUES (?, ?, ?, ?)", quarantine_rows)
+
+    return {"labeled": len(gold_rows), "quarantined": len(quarantine_rows), "calls": llm.calls}

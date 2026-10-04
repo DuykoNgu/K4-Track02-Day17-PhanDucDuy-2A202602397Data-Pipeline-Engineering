@@ -76,13 +76,26 @@ def upsert_silver_tickets(con: duckdb.DuckDBPyConnection, day: str) -> dict:
     """)
     (n_changes,) = con.execute("SELECT count(*) FROM _latest_changes").fetchone()
 
-    # Write this batch's changes to Silver.
-    # A delete arrives as a change with is_deleted = true and every PII column null.
+    # Write this batch's changes to Silver using keyed upsert with LSN guard:
+    # 1. Remove existing rows only if incoming change has a strictly newer LSN.
+    con.execute("""
+        DELETE FROM silver_tickets
+        WHERE ticket_id IN (
+            SELECT t.ticket_id
+            FROM silver_tickets t
+            JOIN _latest_changes c ON t.ticket_id = c.ticket_id
+            WHERE c._lsn > t._lsn
+        )
+    """)
+    # 2. Insert incoming changes for tickets that are not present (new, or removed above).
     con.execute("""
         INSERT INTO silver_tickets
         SELECT ticket_id, user_id, subject, body, priority, status, category,
                created_at, updated_at, is_deleted, _lsn, _batch_id
-        FROM _latest_changes
+        FROM _latest_changes c
+        WHERE NOT EXISTS (
+            SELECT 1 FROM silver_tickets t WHERE t.ticket_id = c.ticket_id
+        )
     """)
     (n_rows,) = con.execute("SELECT count(*) FROM silver_tickets").fetchone()
     return {"changes_in_batch": n_changes, "silver_rows": n_rows}
